@@ -52,7 +52,7 @@ class AgentNodes:
                 and re.match(r"^(а\s|и\s|подробнее\b|поясни\b|уточни\b)", question, re.I)):
             question = f"Предыдущий вопрос: {previous[-1]}\nУточнение: {question}"
         route, action, error = self.router.classify(question)
-        update = dict(question=question, route=route, retrieved=[], draft="", critique=None,
+        update = dict(question=question, route=route, retrieved=[], draft="", critique=None, critique_history=[],
                       iterations=0, approved=False, pending_action=action,
                       tool_result=None, error=error, final=None)
         self.event({**state, **update}, config, "route", route=route,
@@ -143,7 +143,12 @@ class AgentNodes:
                 except Exception:
                     result = Critique(decision="fallback", issues=["Проверка обоснованности недоступна."],
                                       grounded=False, relevant=False)
-        update = {"critique": result.model_dump()}
+        # Persist per-generation feedback in checkpoints, never in the JSONL
+        # audit. This is presentation data; the critique algorithm is unchanged.
+        update = {"critique": result.model_dump(), "critique_history": [
+            *state.get("critique_history", []),
+            {"iteration": state["iterations"], **result.model_dump()},
+        ]}
         self.event({**state, **update}, config, "critique", decision=result.decision,
                    grounded=result.grounded, relevant=result.relevant, issues_count=len(result.issues),
                    transition=after_critique({**state, **update}))

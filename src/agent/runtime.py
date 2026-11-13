@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from typing import Callable, Iterator, Literal
 from uuid import uuid4
 
+from filelock import FileLock, Timeout
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
@@ -52,6 +53,11 @@ class GraphAgent:
     def state(self, thread_id: str):
         return self.graph.get_state(self.config(thread_id))
 
+    def threads(self) -> list[str]:
+        """Discover persisted dialogues through the checkpointer's public API."""
+        return sorted({item.config["configurable"]["thread_id"]
+                       for item in self.graph.checkpointer.list(None)})
+
     def ask(self, question: str, thread_id: str) -> Outcome:
         if not question.strip() or len(question) > 8000:
             raise ValueError("Вопрос должен содержать от 1 до 8000 символов.")
@@ -93,6 +99,10 @@ class GraphAgent:
                        result=AgentResult.model_validate(output["final"]))
 
 
+class AgentBusyError(RuntimeError):
+    """Another process/session currently owns this checkpoint database."""
+
+
 @contextmanager
 def open_agent(settings: AgentSettings | None = None, *, llm: LLM | None = None,
                pipeline_factory: Callable[[], RAGPipeline] | None = None,
@@ -109,5 +119,15 @@ def open_agent(settings: AgentSettings | None = None, *, llm: LLM | None = None,
     tools = AgentTools(pipeline_factory or default_pipeline, s.retrieval_mode, s.agent_timezone, s.agent_reports_db)
     audit = AuditLog(s.agent_log_path, observer, mode)
     s.agent_checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
-    with SqliteSaver.from_conn_string(str(s.agent_checkpoint_db)) as checkpointer:
-        yield GraphAgent(build_graph(tools, backend, AgentRouter(backend, s.prompts_dir), audit, checkpointer), audit)
+    # A separate saver/connection per operation, serialized across CLI processes
+    # and Streamlit sessions. Never hold/cache a SQLite connection in the UI.
+    lock = FileLock(str(s.agent_checkpoint_db.resolve()) + ".lock")
+    try:
+        lock.acquire(timeout=0)
+    except Timeout:
+        raise AgentBusyError("Агент занят. Повторите операцию после завершения запроса.") from None
+    try:
+        with SqliteSaver.from_conn_string(str(s.agent_checkpoint_db)) as checkpointer:
+            yield GraphAgent(build_graph(tools, backend, AgentRouter(backend, s.prompts_dir), audit, checkpointer), audit)
+    finally:
+        lock.release()

@@ -67,6 +67,7 @@ class AgentState(TypedDict, total=False):
     retrieved: list[Chunk]
     draft: str
     critique: dict[str, Any] | None
+    critique_history: list[dict[str, Any]]
     iterations: int
     approved: bool
     pending_action: dict[str, Any] | None
