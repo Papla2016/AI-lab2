@@ -7,4 +7,7 @@ storage/*
 data/*
 !data/.gitkeep
 evaluation/results.*
+work/
+logs/*
+!logs/graph_run.jsonl
 
