@@ -1,0 +1,19 @@
+flowchart TD
+    START([START]) --> route
+    route -->|document| retrieve
+    route -->|time| call_tools
+    route -->|side_effect| approve
+    route -->|smalltalk / out_of_scope| finalize
+    retrieve -->|usable context| generate
+    retrieve -->|empty / weak / error| finalize
+    call_tools --> finalize
+    generate --> critique
+    critique -->|accept| finalize
+    critique -->|fix and iterations < 3| generate
+    critique -->|fallback or iterations = 3| finalize
+    approve -.->|interrupt: persist and pause| HUMAN[Human: approved boolean + action_id]
+    HUMAN -.->|Command resume| approve
+    approve -->|approved = true| call_side_effect
+    approve -->|false / invalid| finalize
+    call_side_effect -->|idempotent local SQLite write / error| finalize
+    finalize --> END([END])

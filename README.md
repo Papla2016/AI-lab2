@@ -1,4 +1,9 @@
-# Лабораторная работа № 1: воспроизводимый RAG
+# Лабораторные работы №1 (RAG) и №2 (LangGraph)
+
+ЛР2 добавляет отдельный агентный слой `src/agent/` над исходным RAG ЛР1.
+Постановка: [SPEC.md](SPEC.md), граф: [graph.mermaid](graph.mermaid),
+отчёт: [report_lab2.md](report_lab2.md) и [PDF](report_lab2.pdf).
+Инструкции ЛР1 ниже сохранены; запуск ЛР2 приведён в конце файла.
 
 Проект реализует реальный локальный конвейер: PDF/Markdown/TXT → рекурсивный chunking → SentenceTransformers → персистентный Chroma → dense или BM25+dense/RRF retrieval → необязательный cross-encoder → защищённый prompt → OpenAI-compatible LLM → проверенный Pydantic JSON с цитатами. Код не привязан к ALT Linux.
 
@@ -141,3 +146,158 @@ OpenAI-compatible LLM по `LLM_BASE_URL`. В реальном корпусе д
 Если генерация ответов по-прежнему не работает, проверьте наличие индекса
 и доступность LLM из `.env` отдельно: подавление этих сообщений
 не исправляет ошибки соединения с LLM.
+
+## ЛР2: LangGraph — агент с контролем потока
+
+Требуется Python 3.11+. Проверено на Python 3.12 с `langgraph==1.2.21`,
+`langgraph-checkpoint-sqlite==3.1.0`, `langchain-core==1.8.0`.
+Установка та же: `pip install -r requirements.txt`, `cp .env.example .env`.
+Все команды выполняются **из корня рабочей копии AI-lab2**.
+Для factual-вопросов положите документацию ALT Linux в `data/`, выполните
+`python -m src.main index` и настройте доступную LLM через существующие
+`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`. Индекс ЛР1 используется напрямую.
+
+```bash
+source .venv/bin/activate
+python -m src.agent.cli ask "Как обновить список пакетов ALT Linux?" --thread-id lab2 --trace
+python -m src.agent.cli ask "А подробнее?" --thread-id lab2 --trace
+python -m src.agent.cli status --thread-id lab2
+```
+
+`--thread-id` сохраняет диалог между процессами; без него `ask` создаёт UUID
+и возвращает его в JSON. Для нового диалога задайте другой идентификатор.
+Идентификатор: 1–64 латинских буквы, цифры, `_`, `-`.
+Явные короткие уточнения (`А ...`, `И ...`, `Подробнее`, `Поясни`, `Уточни`)
+получают предыдущий пользовательский вопрос как контекст поиска; документы
+каждый раз извлекаются заново. Полная история хранится в checkpoint, но не
+подмешивается целиком к доказательствам. Неявные местоименные ссылки могут
+потребовать полного вопроса.
+
+Без LLM, embedding-модели и корпуса работают точные команды:
+
+```bash
+python -m src.agent.cli ask "Привет" --thread-id greeting
+python -m src.agent.cli ask "Сколько времени?" --thread-id clock
+python -m src.agent.cli ask "Отправь отчёт: Проверка документации ALT Linux" --thread-id report --trace
+# Граф приостановлен. Эта команда запускается отдельным процессом:
+python -m src.agent.cli status --thread-id report
+python -m src.agent.cli resume --thread-id report --decision yes --trace
+```
+
+Для отказа создайте новый запрос отчёта и выполните:
+
+```bash
+python -m src.agent.cli ask "Отправь отчёт: Проверка отказа" --thread-id reject
+python -m src.agent.cli resume --thread-id reject --decision no --trace
+```
+
+`resume` принимает только `yes/no`; необязательный `--action-id` проверяет ID
+из запроса подтверждения. Чужой ID отклоняет действие. Ни строка `"true"`,
+ни произвольный текст не считается подтверждением в программном API.
+При ожидающем HITL новый `ask` запрещён, пока пользователь не примет решение.
+Повторный `resume` завершённого запуска возвращает ошибку без вызова инструмента.
+`continue --thread-id ...` восстанавливает незавершённый запуск после сбоя;
+эта команда не обходит HITL.
+
+`send_report` **имитирует** отправку записью в `storage/agent_reports.sqlite`;
+таблица `reports` содержит `action_id`, время, текст. Сеть и shell не вызываются.
+Запись и защита от дубликатов составляют одну SQLite-транзакцию. Отказ не
+создаёт записи или файла отчётов. Путь и получатель не задаются пользовательским
+текстом. Допускается только явная команда «Отправь отчёт: текст» до 4000 символов.
+
+### Граф, структура результата и лимит
+
+`StateGraph`: `route → retrieve → generate → critique → finalize`.
+`fix` возвращает в `generate`, `accept` и `fallback` ведут в `finalize`.
+Ветки инструментов: `route → call_tools → finalize` (время) и
+`route → approve [interrupt] → call_side_effect → finalize` (отчёт).
+Отказ в approve ведёт сразу в finalize. Приветствие и отказ не запускают retrieval.
+Точная схема с условиями находится в `graph.mermaid`.
+
+`iterations` — число входов в `generate` **текущего запроса**, включая ошибки
+LLM, максимум **3**. Маршрутизация и семантический критик не увеличивают счётчик;
+при полном цикле возможно до 7 LLM-вызовов: 1 классификация + 3 генерации +
+3 проверки. Структура/цитаты проверяются локально до семантического критика.
+Последний проверяет релевантность и каждое фактическое утверждение по тексту
+процитированных чанков. `fix` передаёт замечания следующей генерации.
+Ошибка критика даёт безопасный fallback. Исчерпание исправлений даёт
+`iteration_limit`, `insufficient_context=true`, `citations=[]`.
+
+Успешный CLI-вызов печатает JSON-конверт:
+
+```json
+{
+  "thread_id": "lab2",
+  "run_id": "opaque-uuid",
+  "status": "completed",
+  "result": {
+    "answer": "...",
+    "citations": [],
+    "confidence": "low",
+    "insufficient_context": true,
+    "status": "insufficient_context",
+    "thread_id": "lab2",
+    "run_id": "opaque-uuid",
+    "iterations": 0,
+    "tool_result": null
+  },
+  "interrupt": null
+}
+```
+
+При HITL `status="interrupted"`, `result=null`, а `interrupt` содержит имя
+инструмента, `action_id`, аргументы и вопрос подтверждения. До resume итогового
+ответа нет. `result.status`: `answered`, `insufficient_context`, `iteration_limit`,
+`smalltalk`, `time`, `refused`, `action_completed`, `action_rejected`, `error`.
+Для служебных маршрутов цитаты пусты, а `insufficient_context=false` обозначает
+служебное сообщение; оценивать наличие документальных фактов следует только
+при `status="answered"`. Ошибка retrieval/генерации даёт `error` и безопасный
+ответ с `insufficient_context=true`. Ошибка классификации даёт `refused`.
+
+История `messages` использует reducer `add_messages`; остальные поля — last-value.
+Узел `route` очищает retrieved, draft, critique, iterations, approved,
+pending_action, tool_result, error, final при каждом новом запросе.
+SQLite checkpointer, а не Python-переменная или Streamlit, хранит историю и паузу.
+Приложение CLI рассчитано на последовательные команды одного thread_id.
+
+### Настройки и логи ЛР2
+
+Настройки `AGENT_CHECKPOINT_DB`, `AGENT_REPORTS_DB`, `AGENT_LOG_PATH`,
+`AGENT_TIMEZONE` приведены в `.env.example`. По умолчанию время — Europe/Moscow.
+Checkpoint и отчёты исключены из Git, существующий Chroma остаётся в своей коллекции.
+JSONL `logs/graph_run.jsonl` содержит фактические события исполнения: thread/run,
+узел, переход, вызов инструмента, решение критика, номер генерации, HITL и статус.
+`--trace` дублирует эти события в stderr; итоговый JSON остаётся в stdout.
+В аудит не попадают вопросы, документы, текст отчёта, prompts, замечания LLM
+и тела исключений. Диалог и документы сохраняются только в локальном checkpoint.
+
+### Проверки и воспроизводимая демонстрация
+
+```bash
+pytest -q -m "not integration"  # unit, включая все прежние тесты ЛР1
+pytest -q -m "integration and not live"  # настоящий Chroma + отдельные CLI-процессы
+pytest -q                     # вместе; внешний live-тест пропускается по умолчанию
+python -m evaluation.demo_agent --output-dir work/agent-demo
+```
+
+Демо выполняет 7 сценариев (приветствие, отказ, время, factual с исправлением,
+недостаток контекста, согласие и отказ от отчёта) через **реальный LangGraph**,
+но с **явными фикстурами LLM и корпуса**. Это демонстрация управления потоком,
+не измерение качества ALT Linux RAG. Строки аудита помечены `mode="fixture"`;
+`work/agent-demo/results.json` содержит полученные результаты. Приложенный аудит
+может также содержать `mode="live"` для реальных безопасных CLI-инструментов.
+Никаких заранее записанных логов сценарий не копирует: они формируются узлами.
+
+Для полной интеграции сначала проиндексируйте настоящий корпус и запустите LLM:
+
+```bash
+RUN_LIVE_AGENT=1 AGENT_LIVE_QUESTION="Как обновить список пакетов ALT Linux?" \
+  pytest -q -m live
+```
+
+Вопрос должен иметь ответ в вашем корпусе. Live-тест проверяет реальную генерацию
+и принадлежность цитат полученным чанкам. Доступность LLM/embedding-моделей и
+пользовательский корпус не заменяются фикстурами в этом тесте.
+Семантическая критика другой инструкцией той же LLM снижает риск неподтверждённых
+ответов, но не является формальным доказательством истинности или полной защитой
+от prompt injection. Фактическая оценка на корпусе описывается отдельно в отчёте.
